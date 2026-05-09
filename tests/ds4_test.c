@@ -1,9 +1,67 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#ifndef DS4_NO_CUDA
+#include "../ds4_cuda.h"
+#endif
+#include <math.h>
+
+static uint16_t test_float_to_f16(float f) {
+    union {
+        float f;
+        uint32_t u;
+    } v = { .f = f };
+
+    uint32_t sign = (v.u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = v.u & 0x7fffffu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) half++;
+    return (uint16_t)half;
+}
+
+static float test_f16_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31u) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
 #ifndef DS4_NO_METAL
 #include "../ds4_metal.h"
-#include <math.h>
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -41,31 +99,6 @@ static void test_close_engine(bool quality) {
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
     return (n + align - 1) & ~(align - 1);
-}
-
-static uint16_t test_float_to_f16(float f) {
-    union {
-        float f;
-        uint32_t u;
-    } v = { .f = f };
-
-    uint32_t sign = (v.u >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = v.u & 0x7fffffu;
-
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        if ((mant >> (shift - 1)) & 1u) half_mant++;
-        return (uint16_t)(sign | half_mant);
-    }
-    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-
-    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    if (mant & 0x1000u) half++;
-    return (uint16_t)half;
 }
 
 static void test_metal_f16_matvec_fast_nr0_4(void) {
@@ -560,6 +593,363 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+#ifndef DS4_NO_CUDA
+static void test_cuda_tensor_layer(void) {
+    if (!ds4_cuda_init(false)) {
+        fprintf(stderr, "ds4-test: CUDA unavailable, skipping tensor layer test\n");
+        return;
+    }
+
+    TEST_ASSERT(ds4_cuda_available());
+    TEST_ASSERT(ds4_cuda_prefill_stream() != NULL);
+    TEST_ASSERT(ds4_cuda_decode_stream() != NULL);
+    TEST_ASSERT(ds4_cuda_stream_synchronize(ds4_cuda_prefill_stream()) != 0);
+    TEST_ASSERT(ds4_cuda_stream_synchronize(ds4_cuda_decode_stream()) != 0);
+
+    ds4_cuda_tensor *a = ds4_cuda_tensor_alloc(64);
+    ds4_cuda_tensor *b = ds4_cuda_tensor_alloc(64);
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    if (!a || !b) {
+        ds4_cuda_tensor_free(a);
+        ds4_cuda_tensor_free(b);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    uint8_t host_a[64];
+    uint8_t host_b[64];
+    uint8_t host_view[16];
+    for (uint32_t i = 0; i < 64; i++) {
+        host_a[i] = (uint8_t)(i ^ 0x5a);
+        host_b[i] = 0;
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_write(a, 0, host_a, sizeof(host_a)) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(a, 0, host_b, sizeof(host_b)) != 0);
+    TEST_ASSERT(memcmp(host_a, host_b, sizeof(host_a)) == 0);
+
+    ds4_cuda_tensor *view = ds4_cuda_tensor_view(a, 16, 16);
+    TEST_ASSERT(view != NULL);
+    if (!view) {
+        ds4_cuda_tensor_free(a);
+        ds4_cuda_tensor_free(b);
+        ds4_cuda_cleanup();
+        return;
+    }
+    memset(host_view, 0, sizeof(host_view));
+    TEST_ASSERT(ds4_cuda_tensor_read(view, 0, host_view, sizeof(host_view)) != 0);
+    TEST_ASSERT(memcmp(host_a + 16, host_view, sizeof(host_view)) == 0);
+
+    TEST_ASSERT(ds4_cuda_tensor_copy(b, 8, a, 0, 32) != 0);
+    memset(host_b, 0, sizeof(host_b));
+    TEST_ASSERT(ds4_cuda_tensor_read(b, 0, host_b, sizeof(host_b)) != 0);
+    for (uint32_t i = 0; i < 8; i++) {
+        TEST_ASSERT(host_b[i] == 0);
+    }
+    TEST_ASSERT(memcmp(host_a, host_b + 8, 32) == 0);
+    for (uint32_t i = 40; i < 64; i++) {
+        TEST_ASSERT(host_b[i] == 0);
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_memset(b, 0, 0x3c, 64) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(b, 0, host_b, sizeof(host_b)) != 0);
+    for (uint32_t i = 0; i < 64; i++) {
+        TEST_ASSERT(host_b[i] == 0x3c);
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_bytes(a) == 64);
+    TEST_ASSERT(ds4_cuda_tensor_bytes(view) == 16);
+    TEST_ASSERT(ds4_cuda_tensor_device_ptr(a) != NULL);
+    TEST_ASSERT(ds4_cuda_tensor_device_ptr_const(view) != NULL);
+
+    TEST_ASSERT(ds4_cuda_tensor_write(a, 60, host_a, 4) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(a, 61, host_a, 4) == 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(a, 61, host_b, 4) == 0);
+    TEST_ASSERT(ds4_cuda_tensor_copy(b, 61, a, 0, 4) == 0);
+    TEST_ASSERT(ds4_cuda_tensor_memset(a, 61, 0, 4) == 0);
+
+    ds4_cuda_tensor_free(view);
+    ds4_cuda_tensor_free(a);
+    ds4_cuda_tensor_free(b);
+    ds4_cuda_cleanup();
+}
+
+static void test_cuda_row_primitives(void) {
+    if (!ds4_cuda_init(false)) {
+        fprintf(stderr, "ds4-test: CUDA unavailable, skipping row primitive test\n");
+        return;
+    }
+
+    const uint32_t n = 16;
+    const uint32_t rows = 3;
+    const uint32_t n_hc = 4;
+    const uint64_t row_bytes = (uint64_t)n * sizeof(float);
+    const uint64_t rows_bytes = (uint64_t)n * rows * sizeof(float);
+
+    ds4_cuda_tensor *a = ds4_cuda_tensor_alloc(row_bytes);
+    ds4_cuda_tensor *b = ds4_cuda_tensor_alloc(row_bytes);
+    ds4_cuda_tensor *out = ds4_cuda_tensor_alloc(row_bytes);
+    ds4_cuda_tensor *repeat_out = ds4_cuda_tensor_alloc(row_bytes * n_hc);
+    ds4_cuda_tensor *rms_x = ds4_cuda_tensor_alloc(rows_bytes);
+    ds4_cuda_tensor *rms_out = ds4_cuda_tensor_alloc(rows_bytes);
+    TEST_ASSERT(a && b && out && repeat_out && rms_x && rms_out);
+    if (!a || !b || !out || !repeat_out || !rms_x || !rms_out) {
+        ds4_cuda_tensor_free(a);
+        ds4_cuda_tensor_free(b);
+        ds4_cuda_tensor_free(out);
+        ds4_cuda_tensor_free(repeat_out);
+        ds4_cuda_tensor_free(rms_x);
+        ds4_cuda_tensor_free(rms_out);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    float host_a[n];
+    float host_b[n];
+    float host_out[n];
+    float host_repeat[n * n_hc];
+    float host_rms_x[n * rows];
+    float host_rms_out[n * rows];
+
+    for (uint32_t i = 0; i < n; i++) {
+        host_a[i] = (float)((int)(i % 7u) - 3) * 0.5f;
+        host_b[i] = (float)((int)(i % 5u) - 2) * 0.25f;
+    }
+    for (uint32_t i = 0; i < n * rows; i++) {
+        host_rms_x[i] = (float)((int)(i % 11u) - 5) * 0.125f;
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_write(a, 0, host_a, row_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(b, 0, host_b, row_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_add_tensor(out, a, b, n) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(out, 0, host_out, row_bytes) != 0);
+    for (uint32_t i = 0; i < n; i++) {
+        TEST_ASSERT(host_out[i] == host_a[i] + host_b[i]);
+    }
+
+    TEST_ASSERT(ds4_cuda_repeat_hc_tensor(repeat_out, a, n, n_hc) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(repeat_out, 0, host_repeat, row_bytes * n_hc) != 0);
+    for (uint32_t r = 0; r < n_hc; r++) {
+        TEST_ASSERT(memcmp(host_a, host_repeat + (uint64_t)r * n, row_bytes) == 0);
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_write(rms_x, 0, host_rms_x, rows_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_rms_norm_plain_rows_tensor(rms_out, rms_x, n, rows, 1.0e-6f) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(rms_out, 0, host_rms_out, rows_bytes) != 0);
+    for (uint32_t r = 0; r < rows; r++) {
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n; i++) {
+            double v = host_rms_x[(uint64_t)r * n + i];
+            ss += v * v;
+        }
+        float scale = 1.0f / sqrtf((float)(ss / (double)n) + 1.0e-6f);
+        for (uint32_t i = 0; i < n; i++) {
+            float want = host_rms_x[(uint64_t)r * n + i] * scale;
+            float got = host_rms_out[(uint64_t)r * n + i];
+            TEST_ASSERT(fabsf(got - want) < 1.0e-5f);
+        }
+    }
+
+    ds4_cuda_tensor_free(a);
+    ds4_cuda_tensor_free(b);
+    ds4_cuda_tensor_free(out);
+    ds4_cuda_tensor_free(repeat_out);
+    ds4_cuda_tensor_free(rms_x);
+    ds4_cuda_tensor_free(rms_out);
+    ds4_cuda_cleanup();
+}
+
+static void test_cuda_weight_primitives(void) {
+    if (!ds4_cuda_init(false)) {
+        fprintf(stderr, "ds4-test: CUDA unavailable, skipping weight primitive test\n");
+        return;
+    }
+
+    const uint32_t n_vocab = 8;
+    const uint32_t n_embd = 16;
+    const uint32_t n_hc = 4;
+    const uint32_t rows = 2;
+    const uint32_t head_dim = 8;
+    const uint32_t n_head = 2;
+    const uint32_t n_tok = 2;
+    const uint32_t mm_in_dim = 6;
+    const uint32_t mm_out_dim = 5;
+    const uint64_t embd_weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+    const uint64_t rms_weight_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t embd_out_bytes = (uint64_t)n_embd * n_hc * sizeof(float);
+    const uint64_t batch_embd_out_bytes = (uint64_t)n_tok * n_embd * n_hc * sizeof(float);
+    const uint64_t rms_in_bytes = (uint64_t)n_embd * rows * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+    const uint64_t mm_weight_bytes = (uint64_t)mm_in_dim * mm_out_dim * sizeof(uint16_t);
+    const uint64_t mm_x_bytes = (uint64_t)mm_in_dim * sizeof(float);
+    const uint64_t mm_out_bytes = (uint64_t)mm_out_dim * sizeof(float);
+
+    uint16_t *embd_weights = malloc((size_t)embd_weight_bytes);
+    float *rms_weights = malloc((size_t)rms_weight_bytes);
+    uint16_t *mm_weights = malloc((size_t)mm_weight_bytes);
+    TEST_ASSERT(embd_weights != NULL);
+    TEST_ASSERT(rms_weights != NULL);
+    TEST_ASSERT(mm_weights != NULL);
+    if (!embd_weights || !rms_weights || !mm_weights) {
+        free(embd_weights);
+        free(rms_weights);
+        free(mm_weights);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    for (uint32_t t = 0; t < n_vocab; t++) {
+        for (uint32_t i = 0; i < n_embd; i++) {
+            float v = (float)((int)((t * 7u + i * 3u) % 19u) - 9) / 16.0f;
+            embd_weights[(uint64_t)t * n_embd + i] = test_float_to_f16(v);
+        }
+    }
+    for (uint32_t i = 0; i < n_embd; i++) {
+        rms_weights[i] = 0.5f + (float)i * 0.03125f;
+    }
+    for (uint32_t o = 0; o < mm_out_dim; o++) {
+        for (uint32_t i = 0; i < mm_in_dim; i++) {
+            float v = (float)((int)((o * 5u + i * 11u) % 17u) - 8) / 32.0f;
+            mm_weights[(uint64_t)o * mm_in_dim + i] = test_float_to_f16(v);
+        }
+    }
+
+    ds4_cuda_tensor *embd_out = ds4_cuda_tensor_alloc(embd_out_bytes);
+    ds4_cuda_tensor *batch_embd_out = ds4_cuda_tensor_alloc(batch_embd_out_bytes);
+    ds4_cuda_tensor *tokens = ds4_cuda_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
+    ds4_cuda_tensor *rms_in = ds4_cuda_tensor_alloc(rms_in_bytes);
+    ds4_cuda_tensor *rms_out = ds4_cuda_tensor_alloc(rms_in_bytes);
+    ds4_cuda_tensor *head = ds4_cuda_tensor_alloc(head_bytes);
+    ds4_cuda_tensor *mm_x = ds4_cuda_tensor_alloc(mm_x_bytes);
+    ds4_cuda_tensor *mm_out = ds4_cuda_tensor_alloc(mm_out_bytes);
+    TEST_ASSERT(embd_out && batch_embd_out && tokens && rms_in && rms_out && head && mm_x && mm_out);
+    if (!embd_out || !batch_embd_out || !tokens || !rms_in || !rms_out || !head || !mm_x || !mm_out) {
+        ds4_cuda_tensor_free(embd_out);
+        ds4_cuda_tensor_free(batch_embd_out);
+        ds4_cuda_tensor_free(tokens);
+        ds4_cuda_tensor_free(rms_in);
+        ds4_cuda_tensor_free(rms_out);
+        ds4_cuda_tensor_free(head);
+        ds4_cuda_tensor_free(mm_x);
+        ds4_cuda_tensor_free(mm_out);
+        free(embd_weights);
+        free(rms_weights);
+        free(mm_weights);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    int32_t token_host[2] = { 3, 6 };
+    float rms_host_in[rows * n_embd];
+    float head_orig[head_bytes / sizeof(float)];
+    float head_host[head_bytes / sizeof(float)];
+    float mm_x_host[mm_in_dim];
+    float mm_out_host[mm_out_dim];
+    for (uint32_t i = 0; i < rows * n_embd; i++) {
+        rms_host_in[i] = (float)((int)(i % 13u) - 6) * 0.125f;
+    }
+    for (uint32_t i = 0; i < head_bytes / sizeof(float); i++) {
+        head_orig[i] = (float)((int)(i % 9u) - 4) * 0.2f;
+        head_host[i] = head_orig[i];
+    }
+    for (uint32_t i = 0; i < mm_in_dim; i++) {
+        mm_x_host[i] = (float)((int)(i % 5u) - 2) * 0.3f;
+    }
+
+    TEST_ASSERT(ds4_cuda_tensor_write(tokens, 0, token_host, sizeof(token_host)) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(tokens, 0, token_host, sizeof(token_host)) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(rms_in, 0, rms_host_in, rms_in_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(head, 0, head_host, head_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(mm_x, 0, mm_x_host, mm_x_bytes) != 0);
+
+    TEST_ASSERT(ds4_cuda_embed_token_hc_tensor(embd_out, embd_weights, embd_weight_bytes, 0,
+                                               n_vocab, (uint32_t)token_host[0], n_embd, n_hc) != 0);
+    float embd_host[embd_out_bytes / sizeof(float)];
+    float batch_embd_host[batch_embd_out_bytes / sizeof(float)];
+    TEST_ASSERT(ds4_cuda_tensor_read(embd_out, 0, embd_host, embd_out_bytes) != 0);
+    for (uint32_t h = 0; h < n_hc; h++) {
+        for (uint32_t i = 0; i < n_embd; i++) {
+            float want = test_f16_to_float(embd_weights[(uint64_t)token_host[0] * n_embd + i]);
+            TEST_ASSERT(fabsf(embd_host[(uint64_t)h * n_embd + i] - want) < 1.0e-5f);
+        }
+    }
+
+    TEST_ASSERT(ds4_cuda_embed_tokens_hc_tensor(batch_embd_out, tokens, embd_weights, embd_weight_bytes, 0,
+                                                n_vocab, n_tok, n_embd, n_hc) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(batch_embd_out, 0, batch_embd_host, batch_embd_out_bytes) != 0);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t h = 0; h < n_hc; h++) {
+            for (uint32_t i = 0; i < n_embd; i++) {
+                float want = test_f16_to_float(embd_weights[(uint64_t)token_host[t] * n_embd + i]);
+                float got = batch_embd_host[((uint64_t)t * n_hc + h) * n_embd + i];
+                TEST_ASSERT(fabsf(got - want) < 1.0e-5f);
+            }
+        }
+    }
+
+    TEST_ASSERT(ds4_cuda_rms_norm_weight_rows_tensor(rms_out, rms_in, rms_weights, rms_weight_bytes, 0,
+                                                     n_embd, rows, 1.0e-6f) != 0);
+    float rms_host_out[rows * n_embd];
+    TEST_ASSERT(ds4_cuda_tensor_read(rms_out, 0, rms_host_out, rms_in_bytes) != 0);
+    for (uint32_t r = 0; r < rows; r++) {
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            double v = rms_host_in[(uint64_t)r * n_embd + i];
+            ss += v * v;
+        }
+        float scale = 1.0f / sqrtf((float)(ss / (double)n_embd) + 1.0e-6f);
+        for (uint32_t i = 0; i < n_embd; i++) {
+            float want = rms_host_in[(uint64_t)r * n_embd + i] * scale * rms_weights[i];
+            TEST_ASSERT(fabsf(rms_host_out[(uint64_t)r * n_embd + i] - want) < 1.0e-5f);
+        }
+    }
+
+    TEST_ASSERT(ds4_cuda_head_rms_norm_tensor(head, n_tok, n_head, head_dim, 1.0e-6f) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(head, 0, head_host, head_bytes) != 0);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *row = head_host + ((uint64_t)t * n_head + h) * head_dim;
+            const float *orig = head_orig + ((uint64_t)t * n_head + h) * head_dim;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < head_dim; i++) {
+                double v = orig[i];
+                ss += v * v;
+            }
+            float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + 1.0e-6f);
+            for (uint32_t i = 0; i < head_dim; i++) {
+                TEST_ASSERT(fabsf(row[i] - orig[i] * scale) < 1.0e-5f);
+            }
+        }
+    }
+
+    TEST_ASSERT(ds4_cuda_matmul_f16_tensor(mm_out, mm_weights, mm_weight_bytes, 0,
+                                           mm_in_dim, mm_out_dim, mm_x, 1) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(mm_out, 0, mm_out_host, mm_out_bytes) != 0);
+    for (uint32_t o = 0; o < mm_out_dim; o++) {
+        double acc = 0.0;
+        for (uint32_t i = 0; i < mm_in_dim; i++) {
+            float w = test_f16_to_float(mm_weights[(uint64_t)o * mm_in_dim + i]);
+            acc += (double)w * (double)mm_x_host[i];
+        }
+        TEST_ASSERT(fabsf(mm_out_host[o] - (float)acc) < 1.0e-5f);
+    }
+
+    ds4_cuda_tensor_free(embd_out);
+    ds4_cuda_tensor_free(batch_embd_out);
+    ds4_cuda_tensor_free(tokens);
+    ds4_cuda_tensor_free(rms_in);
+    ds4_cuda_tensor_free(rms_out);
+    ds4_cuda_tensor_free(head);
+    ds4_cuda_tensor_free(mm_x);
+    ds4_cuda_tensor_free(mm_out);
+    free(embd_weights);
+    free(rms_weights);
+    free(mm_weights);
+    ds4_cuda_cleanup();
+}
+#endif
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -574,6 +964,11 @@ typedef struct {
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
+#ifndef DS4_NO_CUDA
+    {"--cuda-tensors", "cuda-tensors", "CUDA tensor allocation and copy boundaries", test_cuda_tensor_layer},
+    {"--cuda-primitives", "cuda-primitives", "CUDA row primitive parity checks", test_cuda_row_primitives},
+    {"--cuda-weights", "cuda-weights", "CUDA weight-backed primitive parity checks", test_cuda_weight_primitives},
+#endif
 #ifndef DS4_NO_METAL
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},

@@ -29,7 +29,14 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized production graph is currently **Metal-first**, with CUDA
+  backend plumbing added for NVIDIA GB10 / Blackwell (`sm_121`) and CUDA 13+.
+  The CUDA graph kernel port is not complete yet. The CPU path is only for
+  correctness checks, but **warning: current macOS versions have a bug in the
+  virtual memory implementation that will crash the kernel** if you try to run
+  the CPU code. Remember? Software sucks. It was not possible to fix the CPU
+  inference to avoid crashing, since each time you have to restart the
+  computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -138,9 +145,12 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
+The server requires a graph backend with session support. The current complete
+graph implementation is Metal; CUDA session support is being ported and fails
+explicitly until the CUDA kernels are available. The server keeps one mutable
+graph/KV checkpoint in memory, so stateless clients that resend a longer
+version of the same prompt can reuse the shared prefix instead of pre-filling
+from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
 serialized through one Metal worker. The current server does not batch multiple
@@ -482,11 +492,24 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+On macOS, the default backend is Metal:
 
 ```sh
 ./ds4 -p "Hello" --metal
 ```
+
+On Linux CUDA builds, the default backend is CUDA and the build targets
+NVIDIA GB10 / Blackwell (`sm_121`) with CUDA 13+:
+
+```sh
+make CUDA_ARCH=sm_121
+./ds4 -p "Hello" --cuda
+```
+
+The CUDA runtime path currently initializes and validates the device, memory
+model, and build/link configuration. The full DS4 graph kernel port is still in
+progress, so CUDA generation and server sessions fail explicitly rather than
+falling back silently.
 
 There is also a CPU reference/debug path:
 
@@ -494,9 +517,9 @@ There is also a CPU reference/debug path:
 ./ds4 -p "Hello" --cpu
 ```
 
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
+Do not treat the CPU path as the production target. The optimized
+implementation currently lives in the Metal graph path while CUDA graph kernels
+are being ported.
 
 ## Test Vectors
 

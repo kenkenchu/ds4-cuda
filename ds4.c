@@ -39,6 +39,9 @@
 #ifndef DS4_NO_METAL
 #include "ds4_metal.h"
 #endif
+#ifndef DS4_NO_CUDA
+#include "ds4_cuda.h"
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -13167,7 +13170,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    if (backend == DS4_BACKEND_METAL) {
+    if (backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA) {
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
@@ -13543,6 +13546,7 @@ struct ds4_engine {
     float mtp_margin;
     bool quality;
     bool metal_ready;
+    bool cuda_ready;
     bool mtp_ready;
 };
 
@@ -14652,11 +14656,21 @@ static int generate_metal_graph_raw_swa(
 
 #ifdef DS4_NO_METAL
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
-    (void)backend;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    m.raw_cap = ds4_default_raw_cap(ctx);
+    if (backend == DS4_BACKEND_CUDA) {
+        m.prefill_cap = ctx > 2048u ? 2048u : ctx;
+        uint64_t wanted = (uint64_t)ds4_default_raw_cap(ctx) + m.prefill_cap;
+        if (wanted > ctx) wanted = ctx;
+        if (wanted == 0) wanted = 1;
+        wanted = align_up(wanted, 256u);
+        if (wanted > 8192u) wanted = 8192u;
+        m.raw_cap = (uint32_t)wanted;
+        if (m.raw_cap < ds4_default_raw_cap(ctx)) m.raw_cap = ds4_default_raw_cap(ctx);
+    } else {
+        m.raw_cap = ds4_default_raw_cap(ctx);
+    }
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
                   m.raw_cap *
                   DS4_N_HEAD_DIM *
@@ -14694,7 +14708,12 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL ? "metal" : "cpu";
+    switch (backend) {
+    case DS4_BACKEND_METAL: return "metal";
+    case DS4_BACKEND_CUDA:  return "cuda";
+    case DS4_BACKEND_CPU:   return "cpu";
+    }
+    return "unknown";
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -15515,6 +15534,21 @@ int ds4_engine_generate_argmax(
 #endif
     }
 
+    if (e->backend == DS4_BACKEND_CUDA) {
+#ifndef DS4_NO_CUDA
+        if (!e->cuda_ready) {
+            fprintf(stderr, "ds4: CUDA generation requested but CUDA is unavailable\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: CUDA backend is initialized, but the DS4 graph CUDA kernels are not implemented yet\n");
+        return 1;
+#else
+        fprintf(stderr, "ds4: CUDA generation requested but this build has no CUDA support\n");
+        return 1;
+#endif
+    }
+
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
                                 ctx_size, emit, done, emit_ud, progress, progress_ud);
 }
@@ -15716,15 +15750,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path,
-               opt->backend == DS4_BACKEND_METAL, true);
+    const bool gpu_backend = opt->backend == DS4_BACKEND_METAL ||
+                             opt->backend == DS4_BACKEND_CUDA;
+    model_open(&e->model, opt->model_path, gpu_backend, true);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path,
-                   opt->backend == DS4_BACKEND_METAL, true);
+        model_open(&e->mtp_model, opt->mtp_path, gpu_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -15778,6 +15812,32 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+#ifndef DS4_NO_CUDA
+    if (e->backend == DS4_BACKEND_CUDA) {
+        e->cuda_ready = ds4_cuda_init(e->quality) != 0;
+        if (!e->cuda_ready) {
+            fprintf(stderr, "ds4: CUDA backend unavailable; aborting startup\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->mtp_ready) {
+            fprintf(stderr, "ds4: CUDA backend does not support MTP yet; aborting startup\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        ds4_cuda_print_memory_report("after init");
+    }
+#else
+    if (e->backend == DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: CUDA backend requested but this build has no CUDA support; aborting startup\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+#endif
+
     *out = e;
     return 0;
 }
@@ -15795,6 +15855,9 @@ void ds4_engine_close(ds4_engine *e) {
     model_close(&e->model);
 #ifndef DS4_NO_METAL
     ds4_metal_cleanup();
+#endif
+#ifndef DS4_NO_CUDA
+    ds4_cuda_cleanup();
 #endif
     ds4_release_instance_lock();
     free(e);
@@ -15855,6 +15918,7 @@ typedef struct {
     void *user_ud;
 } ds4_sync_progress;
 
+#ifndef DS4_NO_METAL
 static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
     ds4_sync_progress *p = ud;
     if (!p || !p->session || !p->prompt) return;
@@ -15866,6 +15930,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
+#endif
 
 /* Bring the Metal graph to exactly the supplied token prefix.
  *

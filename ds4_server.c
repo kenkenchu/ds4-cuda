@@ -1,6 +1,14 @@
 #include "ds4.h"
 #include "rax.h"
 
+#if defined(DS4_NO_METAL) && !defined(DS4_NO_CUDA)
+#define DS4_DEFAULT_BACKEND DS4_BACKEND_CUDA
+#define DS4_DEFAULT_BACKEND_NAME "cuda"
+#else
+#define DS4_DEFAULT_BACKEND DS4_BACKEND_METAL
+#define DS4_DEFAULT_BACKEND_NAME "metal"
+#endif
+
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
@@ -6965,6 +6973,15 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
     return v;
 }
 
+static ds4_backend parse_backend_arg(const char *s) {
+    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid backend: %s", s);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid backends are: metal, cuda, cpu");
+    exit(2);
+}
+
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: missing value for %s", opt);
@@ -7021,6 +7038,12 @@ static void usage(FILE *fp) {
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
+        "  --cuda\n"
+        "      Use the CUDA backend. Target: NVIDIA GB10/Blackwell, CUDA 13+, sm_121.\n"
+        "  --metal\n"
+        "      Use the Metal graph backend.\n"
+        "  --backend NAME\n"
+        "      Select backend explicitly: metal, cuda, or cpu. Default: " DS4_DEFAULT_BACKEND_NAME "\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
@@ -7074,7 +7097,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  The server requires a graph backend with session support. CUDA graph kernels are still in progress.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -7086,7 +7109,7 @@ static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = DS4_BACKEND_METAL,
+            .backend = DS4_DEFAULT_BACKEND,
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -7147,9 +7170,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
-            exit(2);
+        } else if (!strcmp(arg, "--backend")) {
+            c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--cpu")) {
+            c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = DS4_BACKEND_METAL;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
@@ -7185,7 +7213,9 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: failed to create %s session",
+                   ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
         return 1;
     }

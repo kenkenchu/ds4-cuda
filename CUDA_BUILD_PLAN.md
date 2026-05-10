@@ -21,17 +21,44 @@ Completed:
 - CLI and server accept `--cuda` and `--backend cuda`.
 - CUDA runtime initialization validates the selected CUDA device and reports
   memory.
-- CUDA generation and server sessions fail explicitly instead of silently
-  falling back to CPU.
+- CUDA tensor/runtime helpers exist for allocation, views, copies, writes,
+  reads, memsets, streams, and synchronization.
+- CUDA primitive kernels exist for:
+  - `add`
+  - `repeat_hc`
+  - `rms_norm_plain`
+  - `embed_token_hc`
+  - `embed_tokens_hc`
+  - `rms_norm_weight`
+  - `head_rms_norm`
+  - `matmul_f16`
+  - `matmul_f16_pair`
+  - `matmul_f32`
+  - `matmul_q8_0`
+  - `matmul_q8_0_pair`
+  - `hc_post`
+  - `rope_tail`
+  - `hc_pre_from_state`
+- CUDA router selection kernels exist for hash-mode and top-k expert routing.
 - Existing test target passes on Linux.
 
 Not completed:
 
-- CUDA tensor allocation/read/write/copy is not wired into the graph executor.
-- CUDA kernels for DS4 graph primitives are not implemented.
+- CUDA generation and server sessions still fail explicitly instead of running
+  the model.
 - CUDA session allocation is not enabled.
+- CUDA attention, MoE, and full decode/session orchestration are not
+  implemented yet.
 - CUDA prefill/decode correctness is not validated against CPU or official
   vectors.
+
+Progress notes:
+
+- The current CUDA work is a true device-side kernel layer, not a CPU fallback.
+- The Metal implementation is being treated as a reference for model behavior,
+  not as a required runtime target for CUDA work.
+- The remaining gap is the graph/session executor and the last model-specific
+  layer kernels needed to drive generation end-to-end.
 
 ## Porting Strategy
 
@@ -78,6 +105,12 @@ Exit criteria:
 - CUDA-owned activation/KV scratch tensors can be allocated and validated
   independently of the Metal graph.
 
+Status:
+
+- Done. CUDA tensor/runtime helpers are in place and covered by tests.
+- The model mmap is still host-resident; CUDA kernels stage host weights to
+  device memory as needed.
+
 ## Milestone 2: Primitive Kernel Bring-Up
 
 Goal: port the smallest graph primitives and compare against CPU references.
@@ -112,6 +145,41 @@ Exit criteria:
 - Primitive tests pass for the first batch without depending on full model
   weights.
 
+Status:
+
+- In progress, with the initial and mid-level primitives implemented:
+  - embedding
+  - plain and weighted RMSNorm
+  - head RMSNorm
+  - Q8_0 and F16/F32 matmuls
+  - HC post/pre glue
+  - basic RoPE tail transform
+- Still missing the attention and MoE kernels needed to run the model.
+- Router score/top-k selection is now on CUDA and covered by tests.
+
+Concrete next steps:
+
+1. Finish the remaining layer-local CUDA kernels that the forward path needs:
+   - routed expert gate/up matmuls
+   - routed expert down matmul
+   - shared expert Q8 path
+   - fused shared-down + HC expand path
+2. Port attention and KV cache behavior to CUDA:
+   - raw SWA store/load
+   - compressor state updates
+   - ratio-4 compressed KV replay
+   - indexer score computation and compressed-row masking
+   - raw plus compressed attention for prefill and decode
+3. Introduce CUDA session state and wire it into `ds4_session`:
+   - CUDA graph/session struct
+   - CUDA buffer allocation for context and prefill cap
+   - CUDA prefill and one-token decode
+   - checkpoint and session resume semantics
+4. Route `ds4_engine_generate_argmax()` to the CUDA session path and keep
+   logits readback on the host only for sampling and top-logprobs.
+5. Add CUDA generation tests for short greedy decode, session extension,
+   checkpoint rewrite/rebuild behavior, and payload save/load.
+
 ## Milestone 3: Quantized Matmul and MoE Kernels
 
 Goal: port DS4-specific quantized expert paths.
@@ -141,6 +209,12 @@ Validation:
 Exit criteria:
 
 - One full FFN block can run on CUDA and match CPU within tolerance.
+
+Status:
+
+- Not started as a full block yet.
+- The basic Q8_0/F16/F32 projections and router selection are in place, but
+  the routed expert matmuls and fused shared expert path are still missing.
 
 ## Milestone 4: Attention and Compressed KV
 
@@ -173,6 +247,12 @@ Exit criteria:
 
 - CUDA can prefill a prompt and produce logits matching CPU/Metal tolerance.
 
+Status:
+
+- Not started.
+- This milestone is the main remaining model-behavior gap after the basic
+  primitive kernels.
+
 ## Milestone 5: Full Decode Session
 
 Goal: make `ds4_session_create`, `ds4_session_sync`, and `ds4_session_eval`
@@ -197,6 +277,12 @@ Exit criteria:
 
 - `./ds4 -p "..." --cuda -n 32 --nothink` generates tokens without CPU graph
   fallback.
+
+Status:
+
+- Not started.
+- This is the first milestone that actually replaces the Metal graph/session
+  execution path with CUDA-driven generation.
 
 ## Milestone 6: Server Enablement
 

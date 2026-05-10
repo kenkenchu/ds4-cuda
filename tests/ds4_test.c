@@ -60,6 +60,51 @@ static float test_f16_to_float(uint16_t h) {
     return out;
 }
 
+static float test_softplus_stable(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static void test_router_topk_desc(const float *score, int n, int k, int *idx) {
+    for (int i = 0; i < k; i++) idx[i] = -1;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < k; j++) {
+            if (idx[j] < 0 || score[i] > score[idx[j]]) {
+                for (int m = k - 1; m > j; m--) idx[m] = idx[m - 1];
+                idx[j] = i;
+                break;
+            }
+        }
+    }
+}
+
+static void test_router_expected(const float *logits, const float *bias, const int32_t *hash_row,
+                                 bool hash_mode, int *selected, float *weights) {
+    float probs[256];
+    float scores[256];
+    for (int i = 0; i < 256; i++) {
+        probs[i] = sqrtf(test_softplus_stable(logits[i]));
+        scores[i] = probs[i] + (bias ? bias[i] : 0.0f);
+    }
+
+    if (hash_mode) {
+        for (int i = 0; i < 6; i++) selected[i] = hash_row[i];
+    } else {
+        test_router_topk_desc(scores, 256, 6, selected);
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < 6; i++) {
+        weights[i] = (selected[i] >= 0 && selected[i] < 256) ? probs[selected[i]] : 0.0f;
+        sum += weights[i];
+    }
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (int i = 0; i < 6; i++) {
+        weights[i] = weights[i] / sum * 1.5f;
+    }
+}
+
 #ifndef DS4_NO_METAL
 #include "../ds4_metal.h"
 
@@ -948,6 +993,120 @@ static void test_cuda_weight_primitives(void) {
     free(mm_weights);
     ds4_cuda_cleanup();
 }
+
+static void test_cuda_router_select(void) {
+    if (!ds4_cuda_init(false)) {
+        fprintf(stderr, "ds4-test: CUDA unavailable, skipping router select test\n");
+        return;
+    }
+
+    const uint32_t n_tok = 2;
+    const uint32_t logits_bytes = (uint64_t)n_tok * 256u * sizeof(float);
+    const uint32_t selected_bytes = (uint64_t)n_tok * 6u * sizeof(int32_t);
+    const uint32_t weights_bytes = (uint64_t)n_tok * 6u * sizeof(float);
+    const uint32_t probs_bytes = logits_bytes;
+
+    float *logits = malloc(logits_bytes);
+    float *bias = malloc(256u * sizeof(float));
+    int32_t *hash_table = malloc(3u * 6u * sizeof(int32_t));
+    TEST_ASSERT(logits != NULL);
+    TEST_ASSERT(bias != NULL);
+    TEST_ASSERT(hash_table != NULL);
+    if (!logits || !bias || !hash_table) {
+        free(logits);
+        free(bias);
+        free(hash_table);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    for (uint32_t i = 0; i < 256u; i++) {
+        bias[i] = (float)((int)(i % 9u) - 4) * 0.03125f;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            logits[(uint64_t)t * 256u + i] = (float)((int)((t * 11u + i * 7u) % 23u) - 11) * 0.125f;
+        }
+    }
+    for (uint32_t r = 0; r < 3u; r++) {
+        for (uint32_t j = 0; j < 6u; j++) {
+            hash_table[(uint64_t)r * 6u + j] = (int32_t)((r * 37u + j * 19u) % 256u);
+        }
+    }
+
+    ds4_cuda_tensor *logits_dev = ds4_cuda_tensor_alloc(logits_bytes);
+    ds4_cuda_tensor *probs_dev = ds4_cuda_tensor_alloc(probs_bytes);
+    ds4_cuda_tensor *selected_dev = ds4_cuda_tensor_alloc(selected_bytes);
+    ds4_cuda_tensor *weights_dev = ds4_cuda_tensor_alloc(weights_bytes);
+    ds4_cuda_tensor *tokens_dev = ds4_cuda_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
+    TEST_ASSERT(logits_dev && probs_dev && selected_dev && weights_dev && tokens_dev);
+    if (!logits_dev || !probs_dev || !selected_dev || !weights_dev || !tokens_dev) {
+        ds4_cuda_tensor_free(logits_dev);
+        ds4_cuda_tensor_free(probs_dev);
+        ds4_cuda_tensor_free(selected_dev);
+        ds4_cuda_tensor_free(weights_dev);
+        ds4_cuda_tensor_free(tokens_dev);
+        free(logits);
+        free(bias);
+        free(hash_table);
+        ds4_cuda_cleanup();
+        return;
+    }
+
+    int32_t token_ids[2] = { 2, 1 };
+    TEST_ASSERT(ds4_cuda_tensor_write(logits_dev, 0, logits, logits_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_write(tokens_dev, 0, token_ids, sizeof(token_ids)) != 0);
+
+    TEST_ASSERT(ds4_cuda_router_select_batch_tensor(selected_dev, weights_dev, probs_dev,
+                                                    bias, 256u * sizeof(float),
+                                                    0, 0, 0, 1, 0, true, false,
+                                                    logits_dev, tokens_dev, n_tok) != 0);
+
+    float probs_host[2 * 256];
+    int32_t selected_host[2 * 6];
+    float weights_host[2 * 6];
+    TEST_ASSERT(ds4_cuda_tensor_read(probs_dev, 0, probs_host, probs_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(selected_dev, 0, selected_host, selected_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(weights_dev, 0, weights_host, weights_bytes) != 0);
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        int want_selected[6];
+        float want_weights[6];
+        test_router_expected(logits + (uint64_t)t * 256u, bias, NULL, false,
+                             want_selected, want_weights);
+        for (int i = 0; i < 6; i++) {
+            TEST_ASSERT(selected_host[(uint64_t)t * 6u + i] == want_selected[i]);
+            TEST_ASSERT(fabsf(weights_host[(uint64_t)t * 6u + i] - want_weights[i]) < 1.0e-5f);
+        }
+        for (uint32_t i = 0; i < 256u; i++) {
+            float want = sqrtf(test_softplus_stable(logits[(uint64_t)t * 256u + i]));
+            TEST_ASSERT(fabsf(probs_host[(uint64_t)t * 256u + i] - want) < 1.0e-5f);
+        }
+    }
+
+    TEST_ASSERT(ds4_cuda_router_select_tensor(selected_dev, weights_dev, probs_dev,
+                                              hash_table, 3u * 6u * sizeof(int32_t),
+                                              0, 0, 3u, 2, 1, 0, false, true,
+                                              logits_dev) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(selected_dev, 0, selected_host, selected_bytes) != 0);
+    TEST_ASSERT(ds4_cuda_tensor_read(weights_dev, 0, weights_host, weights_bytes) != 0);
+
+    int want_selected[6];
+    float want_weights[6];
+    test_router_expected(logits, NULL, hash_table + 2u * 6u, true, want_selected, want_weights);
+    for (int i = 0; i < 6; i++) {
+        TEST_ASSERT(selected_host[i] == want_selected[i]);
+        TEST_ASSERT(fabsf(weights_host[i] - want_weights[i]) < 1.0e-5f);
+    }
+
+    ds4_cuda_tensor_free(logits_dev);
+    ds4_cuda_tensor_free(probs_dev);
+    ds4_cuda_tensor_free(selected_dev);
+    ds4_cuda_tensor_free(weights_dev);
+    ds4_cuda_tensor_free(tokens_dev);
+    free(logits);
+    free(bias);
+    free(hash_table);
+    ds4_cuda_cleanup();
+}
 #endif
 
 static void test_server_unit_group(void) {
@@ -968,6 +1127,7 @@ static const ds4_test_entry test_entries[] = {
     {"--cuda-tensors", "cuda-tensors", "CUDA tensor allocation and copy boundaries", test_cuda_tensor_layer},
     {"--cuda-primitives", "cuda-primitives", "CUDA row primitive parity checks", test_cuda_row_primitives},
     {"--cuda-weights", "cuda-weights", "CUDA weight-backed primitive parity checks", test_cuda_weight_primitives},
+    {"--cuda-router", "cuda-router", "CUDA router selection parity checks", test_cuda_router_select},
 #endif
 #ifndef DS4_NO_METAL
     {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},

@@ -47,8 +47,8 @@ Not completed:
 - CUDA generation and server sessions still fail explicitly instead of running
   the model.
 - CUDA session allocation is not enabled.
-- CUDA attention, MoE, and full decode/session orchestration are not
-  implemented yet.
+- CUDA attention, KV cache, compressor, indexer, and full decode/session
+  orchestration are not implemented yet.
 - CUDA prefill/decode correctness is not validated against CPU or official
   vectors.
 
@@ -57,8 +57,10 @@ Progress notes:
 - The current CUDA work is a true device-side kernel layer, not a CPU fallback.
 - The Metal implementation is being treated as a reference for model behavior,
   not as a required runtime target for CUDA work.
-- The remaining gap is the graph/session executor and the last model-specific
-  layer kernels needed to drive generation end-to-end.
+- The MoE decode path (routed IQ2_XXS gate/up matvec, Q2_K down sum6, shared
+  Q8_0 gate+up+swiglu, shared down+HC expand) is now on CUDA.
+- The remaining gap is attention, KV cache, compressor, indexer kernels, and
+  the graph/session executor to drive generation end-to-end.
 
 ## Porting Strategy
 
@@ -256,8 +258,9 @@ Exit criteria:
 Status:
 
 - Not started.
-- This milestone is the main remaining model-behavior gap after the basic
-  primitive kernels.
+- This is the next priority: the attention, compressor, and indexer kernels are
+  the only remaining model-behavior gap between current CUDA kernels and a
+  runnable forward pass.
 
 ## Milestone 5: Full Decode Session
 

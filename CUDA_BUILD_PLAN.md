@@ -154,16 +154,21 @@ Status:
   - Q8_0 and F16/F32 matmuls
   - HC post/pre glue
   - basic RoPE tail transform
-- Still missing the attention and MoE kernels needed to run the model.
-- Router score/top-k selection is now on CUDA and covered by tests.
+  - router score/top-k selection
+  - routed MoE IQ2_XXS gate/up matvec (decode, per-expert)
+  - routed MoE Q2_K down sum6 matvec (decode)
+  - routed MoE weighted SwiGLU activation
+  - shared expert Q8_0 fused gate+up+swiglu (decode)
+  - shared expert fused down + HC expand (decode)
+- Still missing the attention and compressor/indexer kernels needed to run the model.
 
 Concrete next steps:
 
-1. Finish the remaining layer-local CUDA kernels that the forward path needs:
-   - routed expert gate/up matmuls
-   - routed expert down matmul
-   - shared expert Q8 path
-   - fused shared-down + HC expand path
+1. ~~Finish the remaining layer-local CUDA kernels that the forward path needs:~~
+   - ~~routed expert gate/up matmuls~~
+   - ~~routed expert down matmul~~
+   - ~~shared expert Q8 path~~
+   - ~~fused shared-down + HC expand path~~
 2. Port attention and KV cache behavior to CUDA:
    - raw SWA store/load
    - compressor state updates
@@ -212,9 +217,10 @@ Exit criteria:
 
 Status:
 
-- Not started as a full block yet.
-- The basic Q8_0/F16/F32 projections and router selection are in place, but
-  the routed expert matmuls and fused shared expert path are still missing.
+- The basic Q8_0/F16/F32 projections and router selection are in place.
+- Routed MoE kernels (IQ2_XXS gate/up matvec, Q2_K down sum6, weighted SwiGLU) are implemented for decode.
+- Shared expert fused gate+up+swiglu and fused down+HC expand are implemented for decode.
+- Still missing: Q4_K variants, batched (prefill) MoE paths, and the encoder/decoder multi-token orchestration.
 
 ## Milestone 4: Attention and Compressed KV
 

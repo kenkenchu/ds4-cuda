@@ -12,6 +12,117 @@
 #include <cstdint>
 #include <float.h>
 
+// ============================================================
+// Quantized weight block types (CUDA-compatible)
+// ============================================================
+
+#define QK_K 256
+
+typedef struct {
+    uint8_t  scales[QK_K / 16];
+    uint8_t  qs[QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[QK_K / 2];
+} block_q4_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QK_K / 8];
+} block_iq2_xxs;
+
+// ============================================================
+// IQ2_XXS lookup tables (constant memory, read-only on device)
+// ============================================================
+
+__constant__ uint8_t d_kmask_iq2xs[8] = {
+    1, 2, 4, 8, 16, 32, 64, 128
+};
+
+__constant__ uint8_t d_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+__constant__ uint64_t d_iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
 struct ds4_cuda_tensor {
     void *base;
     uint64_t offset;
@@ -678,6 +789,342 @@ __global__ static void ds4_cuda_kernel_hc_weighted_sum(float *out, const float *
         acc += x[(uint64_t)h * n_embd + idx] * weights[h];
     }
     out[idx] = acc;
+}
+
+// ============================================================
+// IQ2_XXS dequantization helpers (device-side)
+// ============================================================
+
+// Dequantize one 16-element sub-block of an IQ2_XXS block.
+// xb: pointer to the block_iq2_xxs
+// il: sub-block index [0..15], produces 16 floats in vals[0..15]
+__device__ static void dequantize_iq2_xxs_sub16(const block_iq2_xxs *xb, int il, float *vals) {
+    const float d = ds4_cuda_half_to_float(xb->d);
+    const int ib32 = il / 2;
+    const int il_mod = il % 2;
+
+    const uint16_t *q2 = xb->qs + (uint64_t)4 * ib32;
+    const uint32_t aux32_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux32_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+
+    const uint8_t *aux8 = (const uint8_t *)&aux32_g;
+    const float dl = d * (0.5f + (float)(aux32_s >> 28)) * 0.25f;
+
+    const uint8_t *grid0 = (const uint8_t *)(d_iq2xxs_grid + aux8[2 * il_mod + 0]);
+    const uint8_t signs0 = d_ksigns_iq2xs[(aux32_s >> (14 * il_mod)) & 127];
+    for (int i = 0; i < 8; i++) {
+        vals[i] = dl * (float)grid0[i] * ((signs0 & d_kmask_iq2xs[i]) ? -1.0f : 1.0f);
+    }
+
+    const uint8_t *grid1 = (const uint8_t *)(d_iq2xxs_grid + aux8[2 * il_mod + 1]);
+    const uint8_t signs1 = d_ksigns_iq2xs[(aux32_s >> (14 * il_mod + 7)) & 127];
+    for (int i = 0; i < 8; i++) {
+        vals[8 + i] = dl * (float)grid1[i] * ((signs1 & d_kmask_iq2xs[i]) ? -1.0f : 1.0f);
+    }
+}
+
+// ============================================================
+// IQ2_XXS single-expert matvec kernel
+// ============================================================
+
+// Each thread block handles one output row.
+// Grid: (out_dim), Block: 32
+__global__ static void ds4_cuda_kernel_moe_iq2_xxs_matvec(
+        float *out,
+        const block_iq2_xxs *weights,   // one expert's full weight matrix [out_dim, blocks_per_row]
+        const float *x,                  // input vector [in_dim]
+        uint32_t in_dim,                 // must be a multiple of QK_K
+        uint32_t out_dim) {
+    __shared__ float dot_sh[32];
+    const uint32_t row = (uint32_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t blocks_per_row = in_dim / QK_K;
+    const block_iq2_xxs *row_w = weights + (uint64_t)row * blocks_per_row;
+
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks_per_row; b++) {
+        const block_iq2_xxs *blk = row_w + b;
+        float local = 0.0f;
+        for (int il = (int)threadIdx.x; il < 16; il += (int)blockDim.x) {
+            float wvals[16];
+            dequantize_iq2_xxs_sub16(blk, il, wvals);
+            for (int i = 0; i < 16; i++) {
+                const uint32_t xi = b * QK_K + (uint32_t)il * 16u + (uint32_t)i;
+                local += wvals[i] * x[xi];
+            }
+        }
+        dot_sh[threadIdx.x] = local;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) dot_sh[threadIdx.x] += dot_sh[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) acc += dot_sh[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = acc;
+}
+
+// ============================================================
+// Q2_K dequantization helper
+// ============================================================
+
+__device__ static void dequantize_q2_K_sub16(const block_q2_K *xb, int il, float *vals) {
+    const float d = ds4_cuda_half_to_float(xb->d);
+    const float min = ds4_cuda_half_to_float(xb->dmin);
+    const uint8_t *q = (const uint8_t *)xb->qs;
+    const uint8_t sc = xb->scales[il];
+
+    q = q + 32u * (uint32_t)(il / 8) + 16u * (uint32_t)(il & 1);
+    const int sub_il = (il / 2) % 4;
+    float coef;
+    uint8_t mask;
+    if (sub_il > 1) {
+        if (sub_il > 2) { coef = 1.0f / 64.0f; mask = 192; }
+        else            { coef = 1.0f / 16.0f; mask = 48;  }
+    } else {
+        if (sub_il > 0) { coef = 1.0f / 4.0f;  mask = 12;  }
+        else            { coef = 1.0f;          mask = 3;   }
+    }
+    const float dl = d * (float)(sc & 0xF) * coef;
+    const float ml = min * (float)(sc >> 4);
+
+    for (int i = 0; i < 16; i++) {
+        vals[i] = dl * (float)(q[i] & mask) - ml;
+    }
+}
+
+// ============================================================
+// Q2_K sum6 down matvec kernel (MoE decode)
+// ============================================================
+
+// For a single token, computes down projection for all 6 selected experts
+// and sums the results. Grid: (out_dim), Block: 32
+__global__ static void ds4_cuda_kernel_moe_q2_k_sum6(
+        float *out,
+        const block_q2_K *const *down_weights,  // array of 6 expert weight pointers
+        const float *mid,                       // mid activation [6, in_dim]
+        const float *route_weights,             // route weights [6]
+        uint32_t in_dim,                        // must be a multiple of QK_K
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    __shared__ float dot_sh[32];
+    const uint32_t row = (uint32_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t blocks_per_row = in_dim / QK_K;
+
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float rw = route_weights[e];
+        const block_q2_K *row_w = down_weights[e] + (uint64_t)row * blocks_per_row;
+        const float *x = mid + (uint64_t)e * in_dim;
+
+        float local = 0.0f;
+        for (uint32_t b = 0; b < blocks_per_row; b++) {
+            const block_q2_K *blk = row_w + b;
+            for (int il = (int)threadIdx.x; il < 16; il += (int)blockDim.x) {
+                float wvals[16];
+                dequantize_q2_K_sub16(blk, il, wvals);
+                for (int i = 0; i < 16; i++) {
+                    const uint32_t xi = b * QK_K + (uint32_t)il * 16u + (uint32_t)i;
+                    local += wvals[i] * x[xi];
+                }
+            }
+        }
+        dot_sh[threadIdx.x] = local;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) dot_sh[threadIdx.x] += dot_sh[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) acc += dot_sh[0] * rw;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = acc;
+}
+
+// ============================================================
+// Weighted SwiGLU activation kernel
+// ============================================================
+
+// For each expert: mid[i] = silu(clamp(gate, -clamp, clamp)) * clamp(up, -clamp, clamp) * weight
+// Grid: (n_expert * out_dim + 255) / 256, Block: 256
+__global__ static void ds4_cuda_kernel_moe_swiglu_weighted(
+        float *mid,
+        const float *gate,
+        const float *up,
+        const float *weights,
+        uint32_t out_dim,    // elements per expert
+        uint32_t n_expert,
+        float clamp_val) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_expert * out_dim;
+    if (idx >= total) return;
+
+    float g = gate[idx];
+    float u = up[idx];
+    const uint32_t expert = (uint32_t)(idx / out_dim);
+
+    if (clamp_val > 0.0f) {
+        if (g < -clamp_val) g = -clamp_val;
+        if (g >  clamp_val) g =  clamp_val;
+        if (u < -clamp_val) u = -clamp_val;
+        if (u >  clamp_val) u =  clamp_val;
+    }
+
+    const float s = 1.0f / (1.0f + expf(-g));
+    const float w = weights[expert];
+    mid[idx] = s * g * u * w;
+}
+
+// ============================================================
+// Shared expert Q8_0 fused gate+up+swiglu kernel (decode)
+// ============================================================
+
+// Fuses Q8_0 gate matvec + Q8_0 up matvec + SwiGLU into one dispatch.
+// For single-token decode. Grid: (out_dim), Block: 32
+__global__ static void ds4_cuda_kernel_shared_gate_up_swiglu_q8_0(
+        float *gate_out,
+        float *up_out,
+        float *mid,
+        const uint8_t *gate_weights,   // Q8_0 layout [out_dim, blocks * 34]
+        const uint8_t *up_weights,     // Q8_0 layout [out_dim, blocks * 34]
+        const int8_t *xq,              // quantized input [blocks * 32]
+        const float *xscale,           // input scale [blocks]
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    __shared__ int32_t dot_sh[32];
+    const uint32_t row = (uint32_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t blocks = in_dim / 32u;
+
+    // Gate matvec
+    {
+        const uint8_t *row_ptr = gate_weights + (uint64_t)row * blocks * 34u;
+        float gate_acc = 0.0f;
+        for (uint32_t b = 0; b < blocks; b++) {
+            const uint8_t *blk = row_ptr + (uint64_t)b * 34u;
+            const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+            const float wscale = ds4_cuda_half_to_float(scale_bits);
+            const int8_t *wq = (const int8_t *)(blk + 2);
+            const int8_t *xqb = xq + (uint64_t)b * 32u;
+            int32_t local = 0;
+            for (uint32_t i = threadIdx.x; i < 32u; i += blockDim.x) {
+                local += (int32_t)wq[i] * (int32_t)xqb[i];
+            }
+            dot_sh[threadIdx.x] = local;
+            __syncthreads();
+            for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) dot_sh[threadIdx.x] += dot_sh[threadIdx.x + stride];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) gate_acc += wscale * xscale[b] * (float)dot_sh[0];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) gate_out[row] = gate_acc;
+    }
+
+    // Up matvec
+    {
+        const uint8_t *row_ptr = up_weights + (uint64_t)row * blocks * 34u;
+        float up_acc = 0.0f;
+        for (uint32_t b = 0; b < blocks; b++) {
+            const uint8_t *blk = row_ptr + (uint64_t)b * 34u;
+            const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+            const float wscale = ds4_cuda_half_to_float(scale_bits);
+            const int8_t *wq = (const int8_t *)(blk + 2);
+            const int8_t *xqb = xq + (uint64_t)b * 32u;
+            int32_t local = 0;
+            for (uint32_t i = threadIdx.x; i < 32u; i += blockDim.x) {
+                local += (int32_t)wq[i] * (int32_t)xqb[i];
+            }
+            dot_sh[threadIdx.x] = local;
+            __syncthreads();
+            for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) dot_sh[threadIdx.x] += dot_sh[threadIdx.x + stride];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) up_acc += wscale * xscale[b] * (float)dot_sh[0];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) up_out[row] = up_acc;
+    }
+
+    // SwiGLU: mid = silu(gate) * up
+    if (threadIdx.x == 0) {
+        const float g = gate_out[row];
+        const float u = up_out[row];
+        const float s = 1.0f / (1.0f + expf(-g));
+        mid[row] = s * g * u;
+    }
+}
+
+// ============================================================
+// Fused shared expert Q8_0 down + HC expand kernel (decode)
+// ============================================================
+
+// Performs Q8_0 down-projection of shared_mid, adds routed_out,
+// then HC-expands via post/comb/split coefficients into out_hc.
+// Grid: (out_dim), Block: 32
+__global__ static void ds4_cuda_kernel_shared_down_hc_expand_q8_0(
+        float *out_hc,
+        float *shared_out,
+        const uint8_t *down_weights,   // Q8_0 layout [out_dim, blocks * 34]
+        const int8_t *xq,              // quantized shared_mid [blocks * 32]
+        const float *xscale,           // scale per block
+        const float *routed_out,       // [out_dim]
+        const float *residual_hc,      // [n_hc * n_embd]
+        const float *post,             // [n_hc]
+        const float *comb,             // [n_hc * n_hc]
+        uint32_t in_dim,               // shared_dim (FF_EXP = 2048)
+        uint32_t out_dim,              // n_embd = 4096
+        uint32_t n_hc) {               // 4
+    __shared__ int32_t dot_sh[32];
+    const uint32_t row = (uint32_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t blocks = in_dim / 32u;
+    const uint8_t *row_ptr = down_weights + (uint64_t)row * blocks * 34u;
+    float so = 0.0f;
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = row_ptr + (uint64_t)b * 34u;
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float wscale = ds4_cuda_half_to_float(scale_bits);
+        const int8_t *wq = (const int8_t *)(blk + 2);
+        const int8_t *xqb = xq + (uint64_t)b * 32u;
+        int32_t local = 0;
+        for (uint32_t i = threadIdx.x; i < 32u; i += blockDim.x) {
+            local += (int32_t)wq[i] * (int32_t)xqb[i];
+        }
+        dot_sh[threadIdx.x] = local;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) dot_sh[threadIdx.x] += dot_sh[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) so += wscale * xscale[b] * (float)dot_sh[0];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) shared_out[row] = so;
+
+    // HC expand: for each HC stream h, compute the output
+    // out_hc[h * n_embd + row] = (shared_out[row] + routed_out[row]) * post[h] + sum_src(comb[h + s * n_hc] * residual_hc[s * n_embd + row])
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const float base = so + routed_out[row];
+        for (uint32_t h = 0; h < n_hc; h++) {
+            float acc = base * post[h];
+            for (uint32_t s = 0; s < n_hc; s++) {
+                acc += comb[h + (uint64_t)s * n_hc] * residual_hc[(uint64_t)s * out_dim + row];
+            }
+            out_hc[(uint64_t)h * out_dim + row] = acc;
+        }
+    }
 }
 
 int ds4_cuda_register_host_memory(const void *ptr, uint64_t bytes) {
@@ -1797,5 +2244,399 @@ int ds4_cuda_hc_pre_from_state_tensor(ds4_cuda_tensor *out_hc,
     ds4_cuda_tensor_free(flat);
     ds4_cuda_tensor_free(mix);
     ds4_cuda_tensor_free(split);
+    return ok;
+}
+
+// ============================================================
+// Routed MoE (single-token decode) wrapper
+// ============================================================
+
+int ds4_cuda_routed_moe_one_tensor(
+        ds4_cuda_tensor       *out,
+        ds4_cuda_tensor       *gate,
+        ds4_cuda_tensor       *up,
+        ds4_cuda_tensor       *mid,
+        ds4_cuda_tensor       *experts,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               gate_offset,
+        uint64_t               up_offset,
+        uint64_t               down_offset,
+        uint32_t               gate_type,
+        uint32_t               down_type,
+        uint64_t               gate_expert_bytes,
+        uint64_t               gate_row_bytes,
+        uint64_t               down_expert_bytes,
+        uint64_t               down_row_bytes,
+        uint32_t               expert_in_dim,
+        uint32_t               expert_mid_dim,
+        uint32_t               out_dim,
+        const ds4_cuda_tensor *selected,
+        const ds4_cuda_tensor *weights,
+        uint32_t               n_expert,
+        float                  clamp,
+        const ds4_cuda_tensor *x) {
+    if (!out || !gate || !up || !mid || !experts || !model_map || !selected || !weights || !x) return 0;
+    if (n_expert < 1 || n_expert > 6) return 0;
+    if (gate_type != 16) { // DS4_TENSOR_IQ2_XXS
+        fprintf(stderr, "ds4: CUDA routed MoE only supports IQ2_XXS gate type, got %u\n", gate_type);
+        return 0;
+    }
+    if (down_type != 10) { // DS4_TENSOR_Q2_K
+        fprintf(stderr, "ds4: CUDA routed MoE only supports Q2_K down type, got %u\n", down_type);
+        return 0;
+    }
+    if (g_cuda_device < 0 && !ds4_cuda_init(false)) return 0;
+
+    const uint64_t x_bytes = (uint64_t)expert_in_dim * sizeof(float);
+    const uint64_t gate_bytes = (uint64_t)expert_mid_dim * sizeof(float);
+    const uint64_t up_bytes = gate_bytes;
+    const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_expert * sizeof(int32_t);
+    const uint64_t wgt_bytes = (uint64_t)n_expert * sizeof(float);
+    if (ds4_cuda_tensor_bytes(x) < x_bytes ||
+        ds4_cuda_tensor_bytes(gate) < gate_bytes * n_expert ||
+        ds4_cuda_tensor_bytes(up) < up_bytes * n_expert ||
+        ds4_cuda_tensor_bytes(mid) < mid_bytes ||
+        ds4_cuda_tensor_bytes(out) < out_bytes ||
+        ds4_cuda_tensor_bytes(selected) < sel_bytes ||
+        ds4_cuda_tensor_bytes(weights) < wgt_bytes) {
+        fprintf(stderr, "ds4: CUDA routed MoE received undersized buffers\n");
+        return 0;
+    }
+
+    cudaStream_t stream = ds4_cuda_prefill_stream();
+
+    int32_t host_sel[6];
+    float host_wgt[6];
+    if (cudaMemcpy(host_sel, ds4_cuda_tensor_device_ptr_const(selected), sel_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    if (cudaMemcpy(host_wgt, ds4_cuda_tensor_device_ptr_const(weights), wgt_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+
+    // Get input x
+    ds4_cuda_tensor *x_dev = ds4_cuda_tensor_alloc(x_bytes);
+    if (!x_dev) return 0;
+    if (cudaMemcpyAsync(ds4_cuda_tensor_device_ptr(x_dev),
+                        ds4_cuda_tensor_device_ptr_const(x),
+                        x_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+        ds4_cuda_tensor_free(x_dev);
+        return 0;
+    }
+
+    // Stage gate weights for all selected experts
+    void *gate_w_dev[6] = {NULL};
+    void *up_w_dev[6] = {NULL};
+    void *down_w_dev[6] = {NULL};
+    const block_q2_K *down_ptrs[6];
+    bool stag_ok = true;
+    for (uint32_t e = 0; e < n_expert && stag_ok; e++) {
+        const uint64_t goff = gate_offset + (uint64_t)host_sel[e] * gate_expert_bytes;
+        stag_ok = (goff <= model_size && gate_row_bytes * expert_mid_dim <= model_size - goff);
+        if (stag_ok) stag_ok = ds4_cuda_copy_host_range_to_device(
+                (const uint8_t *)model_map + goff,
+                gate_row_bytes * expert_mid_dim, &gate_w_dev[e]);
+
+        const uint64_t uoff = up_offset + (uint64_t)host_sel[e] * gate_expert_bytes;
+        if (stag_ok) stag_ok = (uoff <= model_size && gate_row_bytes * expert_mid_dim <= model_size - uoff);
+        if (stag_ok) stag_ok = ds4_cuda_copy_host_range_to_device(
+                (const uint8_t *)model_map + uoff,
+                gate_row_bytes * expert_mid_dim, &up_w_dev[e]);
+
+        const uint64_t doff = down_offset + (uint64_t)host_sel[e] * down_expert_bytes;
+        if (stag_ok) stag_ok = (doff <= model_size && down_row_bytes * out_dim <= model_size - doff);
+        if (stag_ok) stag_ok = ds4_cuda_copy_host_range_to_device(
+                (const uint8_t *)model_map + doff,
+                down_row_bytes * out_dim, &down_w_dev[e]);
+    }
+    if (!stag_ok) {
+        ds4_cuda_tensor_free(x_dev);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (gate_w_dev[e]) cudaFree(gate_w_dev[e]);
+            if (up_w_dev[e]) cudaFree(up_w_dev[e]);
+            if (down_w_dev[e]) cudaFree(down_w_dev[e]);
+        }
+        return 0;
+    }
+
+    // Launch IQ2_XXS gate matvec for each expert
+    for (uint32_t e = 0; e < n_expert; e++) {
+        dim3 grid(expert_mid_dim, 1, 1);
+        dim3 block(32, 1, 1);
+        DS4_CUDA_LAUNCH(ds4_cuda_kernel_moe_iq2_xxs_matvec,
+                        grid, block, (size_t)block.x * sizeof(float), stream,
+                        static_cast<float *>(ds4_cuda_tensor_device_ptr(gate)) + (uint64_t)e * expert_mid_dim,
+                        static_cast<const block_iq2_xxs *>(gate_w_dev[e]),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(x_dev)),
+                        expert_in_dim, expert_mid_dim);
+    }
+
+    // Launch IQ2_XXS up matvec for each expert
+    for (uint32_t e = 0; e < n_expert; e++) {
+        dim3 grid(expert_mid_dim, 1, 1);
+        dim3 block(32, 1, 1);
+        DS4_CUDA_LAUNCH(ds4_cuda_kernel_moe_iq2_xxs_matvec,
+                        grid, block, (size_t)block.x * sizeof(float), stream,
+                        static_cast<float *>(ds4_cuda_tensor_device_ptr(up)) + (uint64_t)e * expert_mid_dim,
+                        static_cast<const block_iq2_xxs *>(up_w_dev[e]),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(x_dev)),
+                        expert_in_dim, expert_mid_dim);
+    }
+
+    // Setup down weight pointers array for sum6 kernel
+    ds4_cuda_tensor *down_ptrs_dev = ds4_cuda_tensor_alloc((uint64_t)n_expert * sizeof(const block_q2_K *));
+    if (!down_ptrs_dev) {
+        ds4_cuda_tensor_free(x_dev);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (gate_w_dev[e]) cudaFree(gate_w_dev[e]);
+            if (up_w_dev[e]) cudaFree(up_w_dev[e]);
+            if (down_w_dev[e]) cudaFree(down_w_dev[e]);
+        }
+        return 0;
+    }
+    for (uint32_t e = 0; e < n_expert; e++) down_ptrs[e] = (const block_q2_K *)down_w_dev[e];
+    if (cudaMemcpyAsync(ds4_cuda_tensor_device_ptr(down_ptrs_dev), down_ptrs,
+                        (uint64_t)n_expert * sizeof(const block_q2_K *),
+                        cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        ds4_cuda_tensor_free(down_ptrs_dev);
+        ds4_cuda_tensor_free(x_dev);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (gate_w_dev[e]) cudaFree(gate_w_dev[e]);
+            if (up_w_dev[e]) cudaFree(up_w_dev[e]);
+            if (down_w_dev[e]) cudaFree(down_w_dev[e]);
+        }
+        return 0;
+    }
+
+    // Stage route weights for sum6 kernel
+    ds4_cuda_tensor *rw_dev = ds4_cuda_tensor_alloc(wgt_bytes);
+    if (!rw_dev) {
+        ds4_cuda_tensor_free(down_ptrs_dev);
+        ds4_cuda_tensor_free(x_dev);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (gate_w_dev[e]) cudaFree(gate_w_dev[e]);
+            if (up_w_dev[e]) cudaFree(up_w_dev[e]);
+            if (down_w_dev[e]) cudaFree(down_w_dev[e]);
+        }
+        return 0;
+    }
+    if (cudaMemcpyAsync(ds4_cuda_tensor_device_ptr(rw_dev), host_wgt, wgt_bytes,
+                        cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        ds4_cuda_tensor_free(down_ptrs_dev);
+        ds4_cuda_tensor_free(rw_dev);
+        ds4_cuda_tensor_free(x_dev);
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (gate_w_dev[e]) cudaFree(gate_w_dev[e]);
+            if (up_w_dev[e]) cudaFree(up_w_dev[e]);
+            if (down_w_dev[e]) cudaFree(down_w_dev[e]);
+        }
+        return 0;
+    }
+
+    // Launch SwiGLU weighted kernel
+    {
+        dim3 swigrid(((uint64_t)n_expert * expert_mid_dim + 255u) / 256u, 1, 1);
+        dim3 swiblock(256, 1, 1);
+        DS4_CUDA_LAUNCH(ds4_cuda_kernel_moe_swiglu_weighted,
+                        swigrid, swiblock, 0, stream,
+                        static_cast<float *>(ds4_cuda_tensor_device_ptr(mid)),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(gate)),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(up)),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(rw_dev)),
+                        expert_mid_dim, n_expert, clamp);
+    }
+
+    // Launch Q2_K sum6 down matvec
+    {
+        dim3 grid(out_dim, 1, 1);
+        dim3 block(32, 1, 1);
+        DS4_CUDA_LAUNCH(ds4_cuda_kernel_moe_q2_k_sum6,
+                        grid, block, (size_t)block.x * sizeof(float), stream,
+                        static_cast<float *>(ds4_cuda_tensor_device_ptr(out)),
+                        (const block_q2_K *const *)ds4_cuda_tensor_device_ptr_const(down_ptrs_dev),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(mid)),
+                        static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(rw_dev)),
+                        expert_mid_dim, out_dim, n_expert);
+    }
+
+    ds4_cuda_tensor_free(rw_dev);
+    ds4_cuda_tensor_free(down_ptrs_dev);
+
+    const int ok = ds4_cuda_stream_synchronize(stream);
+    ds4_cuda_tensor_free(x_dev);
+    for (uint32_t e = 0; e < n_expert; e++) {
+        cudaFree(gate_w_dev[e]);
+        cudaFree(up_w_dev[e]);
+        cudaFree(down_w_dev[e]);
+    }
+    return ok;
+}
+
+// ============================================================
+// Shared expert fused gate+up+swiglu (decode)
+// ============================================================
+
+int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+        ds4_cuda_tensor       *gate,
+        ds4_cuda_tensor       *up,
+        ds4_cuda_tensor       *mid,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               gate_offset,
+        uint64_t               up_offset,
+        uint64_t               in_dim,
+        uint64_t               out_dim,
+        const ds4_cuda_tensor *x) {
+    if (!gate || !up || !mid || !model_map || !x || in_dim == 0 || out_dim == 0) return 0;
+    if ((in_dim & 31u) != 0) return 0;
+    if (g_cuda_device < 0 && !ds4_cuda_init(false)) return 0;
+
+    const uint64_t x_bytes = in_dim * sizeof(float);
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (ds4_cuda_tensor_bytes(x) < x_bytes ||
+        ds4_cuda_tensor_bytes(gate) < out_bytes ||
+        ds4_cuda_tensor_bytes(up) < out_bytes ||
+        ds4_cuda_tensor_bytes(mid) < out_bytes) {
+        return 0;
+    }
+    if (gate_offset > model_size || weight_bytes > model_size - gate_offset ||
+        up_offset > model_size || weight_bytes > model_size - up_offset) {
+        return 0;
+    }
+
+    cudaStream_t stream = ds4_cuda_prefill_stream();
+
+    const uint64_t xq_bytes = blocks * 32u * sizeof(int8_t);
+    const uint64_t xscale_bytes = blocks * sizeof(float);
+
+    const uint8_t *gate_host = (const uint8_t *)model_map + gate_offset;
+    void *gate_dev = NULL;
+    if (!ds4_cuda_copy_host_range_to_device(gate_host, weight_bytes, &gate_dev)) return 0;
+
+    const uint8_t *up_host = (const uint8_t *)model_map + up_offset;
+    void *up_dev = NULL;
+    if (!ds4_cuda_copy_host_range_to_device(up_host, weight_bytes, &up_dev)) { cudaFree(gate_dev); return 0; }
+
+    int8_t *xq = NULL;
+    float *xscale = NULL;
+    if (cudaMalloc(&xq, (size_t)xq_bytes) != cudaSuccess ||
+        cudaMalloc(&xscale, (size_t)xscale_bytes) != cudaSuccess) {
+        cudaFree(gate_dev); cudaFree(up_dev);
+        if (xq) cudaFree(xq);
+        return 0;
+    }
+
+    dim3 qgrid((uint32_t)blocks, 1u, 1);
+    dim3 qblock(32, 1, 1);
+    DS4_CUDA_LAUNCH(ds4_cuda_kernel_quantize_q8_0_batch,
+                    qgrid, qblock, (size_t)qblock.x * sizeof(float), stream,
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(x)),
+                    xq, xscale, 1u, (uint32_t)in_dim, (uint32_t)blocks);
+
+    dim3 grid((uint32_t)out_dim, 1, 1);
+    dim3 block(32, 1, 1);
+    DS4_CUDA_LAUNCH(ds4_cuda_kernel_shared_gate_up_swiglu_q8_0,
+                    grid, block, (size_t)block.x * sizeof(int32_t), stream,
+                    static_cast<float *>(ds4_cuda_tensor_device_ptr(gate)),
+                    static_cast<float *>(ds4_cuda_tensor_device_ptr(up)),
+                    static_cast<float *>(ds4_cuda_tensor_device_ptr(mid)),
+                    static_cast<const uint8_t *>(gate_dev),
+                    static_cast<const uint8_t *>(up_dev),
+                    xq, xscale,
+                    (uint32_t)in_dim, (uint32_t)out_dim);
+
+    const int ok = ds4_cuda_stream_synchronize(stream);
+    cudaFree(gate_dev);
+    cudaFree(up_dev);
+    cudaFree(xq);
+    cudaFree(xscale);
+    return ok;
+}
+
+// ============================================================
+// Shared expert fused down + HC expand (decode)
+// ============================================================
+
+int ds4_cuda_shared_down_hc_expand_q8_0_tensor(
+        ds4_cuda_tensor       *out_hc,
+        ds4_cuda_tensor       *shared_out,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               weight_offset,
+        uint64_t               in_dim,
+        uint64_t               out_dim,
+        const ds4_cuda_tensor *shared_mid,
+        const ds4_cuda_tensor *routed_out,
+        const ds4_cuda_tensor *residual_hc,
+        const ds4_cuda_tensor *split,
+        uint32_t               n_embd,
+        uint32_t               n_hc) {
+    if (!out_hc || !shared_out || !model_map || !shared_mid || !routed_out ||
+        !residual_hc || !split || n_embd == 0 || n_hc == 0 || n_hc != 4) return 0;
+    if ((in_dim & 31u) != 0) return 0;
+    if (g_cuda_device < 0 && !ds4_cuda_init(false)) return 0;
+
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    const uint64_t mid_bytes = in_dim * sizeof(float);
+    const uint64_t embd_bytes = out_dim * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t mix_hc = 2u * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t split_bytes = mix_hc * sizeof(float);
+
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (ds4_cuda_tensor_bytes(shared_mid) < mid_bytes ||
+        ds4_cuda_tensor_bytes(shared_out) < embd_bytes ||
+        ds4_cuda_tensor_bytes(routed_out) < embd_bytes ||
+        ds4_cuda_tensor_bytes(residual_hc) < hc_bytes ||
+        ds4_cuda_tensor_bytes(split) < split_bytes ||
+        ds4_cuda_tensor_bytes(out_hc) < hc_bytes) {
+        return 0;
+    }
+
+    cudaStream_t stream = ds4_cuda_prefill_stream();
+
+    const uint8_t *w_host = (const uint8_t *)model_map + weight_offset;
+    void *w_dev = NULL;
+    if (!ds4_cuda_copy_host_range_to_device(w_host, weight_bytes, &w_dev)) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u * sizeof(int8_t);
+    const uint64_t xscale_bytes = blocks * sizeof(float);
+    int8_t *xq = NULL;
+    float *xscale = NULL;
+    if (cudaMalloc(&xq, (size_t)xq_bytes) != cudaSuccess ||
+        cudaMalloc(&xscale, (size_t)xscale_bytes) != cudaSuccess) {
+        cudaFree(w_dev);
+        if (xq) cudaFree(xq);
+        return 0;
+    }
+
+    dim3 qgrid((uint32_t)blocks, 1u, 1);
+    dim3 qblock(32, 1, 1);
+    DS4_CUDA_LAUNCH(ds4_cuda_kernel_quantize_q8_0_batch,
+                    qgrid, qblock, (size_t)qblock.x * sizeof(float), stream,
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(shared_mid)),
+                    xq, xscale, 1u, (uint32_t)in_dim, (uint32_t)blocks);
+
+    // Fused down + HC expand
+    dim3 grid((uint32_t)out_dim, 1, 1);
+    dim3 block(32, 1, 1);
+    DS4_CUDA_LAUNCH(ds4_cuda_kernel_shared_down_hc_expand_q8_0,
+                    grid, block, (size_t)block.x * sizeof(int32_t), stream,
+                    static_cast<float *>(ds4_cuda_tensor_device_ptr(out_hc)),
+                    static_cast<float *>(ds4_cuda_tensor_device_ptr(shared_out)),
+                    static_cast<const uint8_t *>(w_dev),
+                    xq, xscale,
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(routed_out)),
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(residual_hc)),
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(split)) + n_hc,
+                    static_cast<const float *>(ds4_cuda_tensor_device_ptr_const(split)) + (uint64_t)2u * n_hc,
+                    (uint32_t)in_dim, (uint32_t)out_dim, n_hc);
+
+    const int ok = ds4_cuda_stream_synchronize(stream);
+    cudaFree(w_dev);
+    cudaFree(xq);
+    cudaFree(xscale);
     return ok;
 }
